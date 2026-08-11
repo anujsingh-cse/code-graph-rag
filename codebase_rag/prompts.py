@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from loguru import logger
 
@@ -27,15 +27,24 @@ if TYPE_CHECKING:
 
 
 def extract_tool_names(tools: list["Tool"]) -> ToolNames:
-    registered = {t.name for t in tools}
+    """
+    Extracts the names of registered tools from a list of Tool objects.
 
-    def resolve_tool_name(canonical: AgenticToolName) -> str:
-        if canonical not in registered:
+    If a canonical tool name is not found among the registered tools, a warning is logged,
+    and `None` is returned for that tool, indicating its unavailability. This ensures
+    that the orchestrator prompt does not reference non-existent tools.
+    """
+    registered_tool_names = {t.name for t in tools}
+
+    def resolve_tool_name(canonical: AgenticToolName) -> str | None:
+        canonical_str = str(canonical)
+        if canonical_str not in registered_tool_names:
             logger.warning(
-                f"Tool '{canonical}' is not registered on the agent; "
-                "the orchestrator prompt references it anyway"
+                f"Tool '{canonical_str}' is not registered on the agent. "
+                "It will not be available for use in the orchestrator prompt."
             )
-        return str(canonical)
+            return None
+        return canonical_str
 
     return ToolNames(
         query_graph=resolve_tool_name(AgenticToolName.QUERY_GRAPH),
@@ -134,26 +143,64 @@ def build_rag_orchestrator_prompt(
     project_instructions: str | None = None,
     active_projects: list[str] | None = None,
 ) -> str:
+    """
+    Builds the main orchestrator prompt for the RAG agent, dynamically adjusting
+    instructions based on the availability of specific tools.
+    """
     t = extract_tool_names(tools)
-    base = f"""You are an expert AI assistant for analyzing codebases. Your answers are based **EXCLUSIVELY** on information retrieved using your tools.
 
-**CRITICAL RULES:**
-1.  **TOOL-ONLY ANSWERS**: You must ONLY use information from the tools provided. Do not use external knowledge.
-2.  **NATURAL LANGUAGE QUERIES**: When using the `{t.query_graph}` tool, ALWAYS use natural language questions. NEVER write Cypher queries directly - the tool will translate your natural language into the appropriate database query.
-3.  **HONESTY**: If a tool fails or returns no results, you MUST state that clearly and report any error messages. Do not invent answers.
-4.  **CHOOSE THE RIGHT TOOL FOR THE FILE TYPE**:
-    - For source code files (.py, .ts, etc.), use `{t.read_file}`.
-    - Images and PDFs the user references are attached inline to the message; read them directly from your own multimodal input.
+    has_query = t.query_graph is not None
+    has_semantic = t.semantic_search is not None
+    has_read_file = t.read_file is not None
+    has_create_file = t.create_file is not None
+    has_edit_file = t.edit_file is not None
+    has_shell_command = t.shell_command is not None
 
-**Your General Approach:**
-1.  **Inspect Attached Media Directly**: When the user attaches an image or PDF, analyze it from the inline content of the message. Do not call a tool for it.
-2.  **Deep Dive into Code**: When you identify a relevant component (e.g., a folder), you must go beyond documentation.
+    main_sections: list[str] = []
+
+    # --- Header and Critical Rules ---
+    critical_rules_lines: list[str] = []
+    critical_rules_lines.append("You are an expert AI assistant for analyzing codebases. Your answers are based **EXCLUSIVELY** on information retrieved using your tools.")
+    critical_rules_lines.append("**CRITICAL RULES:**")
+    critical_rules_lines.append("1.  **TOOL-ONLY ANSWERS**: You must ONLY use information from the tools provided. Do not use external knowledge.")
+
+    current_rule_number = 2
+    if has_query:
+        critical_rules_lines.append(f"{current_rule_number}.  **NATURAL LANGUAGE QUERIES**: When using the `{t.query_graph}` tool, ALWAYS use natural language questions. NEVER write Cypher queries directly - the tool will translate your natural language into the appropriate database query.")
+        current_rule_number += 1
+    
+    critical_rules_lines.append(f"{current_rule_number}.  **HONESTY**: If a tool fails or returns no results, you MUST state that clearly and report any error messages. Do not invent answers.")
+    current_rule_number += 1
+
+    file_type_rule_sub_lines: list[str] = []
+    file_type_rule_sub_lines.append(f"{current_rule_number}.  **CHOOSE THE RIGHT TOOL FOR THE FILE TYPE**:")
+    if has_read_file:
+        file_type_rule_sub_lines.append(f"    - For source code files (.py, .ts, etc.), use `{t.read_file}`.")
+    file_type_rule_sub_lines.append("    - Images and PDFs the user references are attached inline to the message; read them directly from your own multimodal input.")
+    critical_rules_lines.append("\n".join(file_type_rule_sub_lines))
+
+    main_sections.append("\n".join(critical_rules_lines))
+
+    # --- Your General Approach ---
+    general_approach_lines: list[str] = []
+    general_approach_lines.append("**Your General Approach:**")
+    general_approach_lines.append("1.  **Inspect Attached Media Directly**: When the user attaches an image or PDF, analyze it from the inline content of the message. Do not call a tool for it.")
+
+    # Deep Dive into Code (Section 2)
+    if has_read_file:
+        general_approach_lines.append("""2.  **Deep Dive into Code**: When you identify a relevant component (e.g., a folder), you must go beyond documentation.
     a. First, check if documentation files like `README.md` exist and read them for context. For configuration, look for files appropriate to the language (e.g., `pyproject.toml` for Python, `package.json` for Node.js).
     b. **Then, you MUST dive into the source code.** Explore the `src` directory (or equivalent). Identify and read key files (e.g., `main.py`, `index.ts`, `app.ts`) to understand the implementation details, logic, and functionality.
     c. Synthesize all this information—from documentation, configuration, and the code itself—to provide a comprehensive, factual answer. Do not just describe the files; explain what the code *does*.
-    d. Only ask for clarification if, after a thorough investigation, the user's intent is still unclear.
-3.  **Choose the Right Search Strategy - SEMANTIC FIRST for Intent**:
-    a. **WHEN TO USE SEMANTIC SEARCH FIRST**: Always start with `{t.semantic_search}` for ANY of these patterns:
+    d. Only ask for clarification if, after a thorough investigation, the user's intent is still unclear.""")
+    else:
+        general_approach_lines.append("2.  **Deep Dive into Code**: Without a `read_file` tool, your ability to explore source code directly is limited. Focus on information gained from other tools or user descriptions.")
+
+    # Choose the Right Search Strategy (Section 3)
+    search_strategy_section_lines: list[str] = []
+    if has_semantic and has_query:
+        search_strategy_section_lines.append(f"3.  **Choose the Right Search Strategy - SEMANTIC FIRST for Intent**:")
+        search_strategy_section_lines.append(f"""    a. **WHEN TO USE SEMANTIC SEARCH FIRST**: Always start with `{t.semantic_search}` for ANY of these patterns:
        - "main entry point", "startup", "initialization", "bootstrap", "launcher"
        - "error handling", "validation", "authentication"
        - "where is X done", "how does Y work", "find Z logic"
@@ -165,51 +212,213 @@ def build_rag_orchestrator_prompt(
        - Java: `public static void main`, `@SpringBootApplication`
        - C/C++: `int main()`, `WinMain`
        - Web: `index.html`, routing configurations, startup middleware
-
-    b. **WHEN TO USE GRAPH DIRECTLY**: Only use `{t.query_graph}` directly for pure structural queries:
+""")
+        search_strategy_section_lines.append(f"""    b. **WHEN TO USE GRAPH DIRECTLY**: Only use `{t.query_graph}` directly for pure structural queries:
        - "What does function X call?" (when you already know X's name)
        - "List methods of User class" (when you know the exact class name)
        - "Show files in folder Y" (when you know the exact folder path)
+""")
+        
+        # Hybrid Approach (3c)
+        hybrid_approach_sub_lines: list[str] = []
+        hybrid_approach_sub_lines.append(f"    c. **HYBRID APPROACH (RECOMMENDED)**: For most queries, use this sequence:")
+        hybrid_approach_sub_lines.append(f"       1. Use `{t.semantic_search}` to find relevant code elements by intent/meaning")
+        hybrid_approach_sub_lines.append(f"       2. Then use `{t.query_graph}` to explore structural relationships")
+        if has_read_file:
+            hybrid_approach_sub_lines.append(f"       3. **CRITICAL**: Always read the actual files using `{t.read_file}` to examine source code")
+        else:
+            hybrid_approach_sub_lines.append(f"       3. (Direct file reading not available to examine source code directly)")
+        hybrid_approach_sub_lines.append(f"       4. For entry points specifically: Look for `if __name__ == \"__main__\"`, `main()` functions, or CLI entry points")
+        search_strategy_section_lines.append("\n".join(hybrid_approach_sub_lines))
 
-    c. **HYBRID APPROACH (RECOMMENDED)**: For most queries, use this sequence:
-       1. Use `{t.semantic_search}` to find relevant code elements by intent/meaning
-       2. Then use `{t.query_graph}` to explore structural relationships
-       3. **CRITICAL**: Always read the actual files using `{t.read_file}` to examine source code
-       4. For entry points specifically: Look for `if __name__ == "__main__"`, `main()` functions, or CLI entry points
+        # Tool Chaining Example (3d)
+        tool_chaining_sub_lines: list[str] = []
+        tool_chaining_sub_lines.append(f"    d. **Tool Chaining Example**: For \"main entry point and what it calls\":")
+        tool_chaining_sub_lines.append(f"       1. `{t.semantic_search}` for focused terms like \"main entry startup\" (not overly broad)")
+        tool_chaining_sub_lines.append(f"       2. `{t.query_graph}` to find specific function relationships")
+        if has_read_file:
+            tool_chaining_sub_lines.append(f"       3. `{t.read_file}` for main.py with targeted sections (use offset/limit for large files)")
+        else:
+            tool_chaining_sub_lines.append(f"       3. (Direct file reading not available for full context)")
+        tool_chaining_sub_lines.append(f"       4. Look for the true application entry point (main function, __main__ block, CLI commands)")
+        tool_chaining_sub_lines.append(f"       5. If you find CLI frameworks (typer, click, argparse), read relevant command sections only")
+        tool_chaining_sub_lines.append(f"       6. Summarize execution flow concisely rather than showing all details")
+        search_strategy_section_lines.append("\n".join(tool_chaining_sub_lines))
 
-    d. **Tool Chaining Example**: For "main entry point and what it calls":
-       1. `{t.semantic_search}` for focused terms like "main entry startup" (not overly broad)
-       2. `{t.query_graph}` to find specific function relationships
-       3. `{t.read_file}` for main.py with targeted sections (use offset/limit for large files)
-       4. Look for the true application entry point (main function, __main__ block, CLI commands)
-       5. If you find CLI frameworks (typer, click, argparse), read relevant command sections only
-       6. Summarize execution flow concisely rather than showing all details
-4.  **Plan Before Writing or Modifying**:
-    a. Before using `{t.create_file}`, `{t.edit_file}`, or modifying files, you MUST explore the codebase to find the correct location and file structure.
-    b. For shell commands: If `{t.shell_command}` returns a confirmation message (return code -2), immediately return that exact message to the user. When they respond "yes", call the tool again with `user_confirmed=True`.
-5.  **Execute Shell Commands**: The `{t.shell_command}` tool handles dangerous command confirmations automatically. If it returns a confirmation prompt, pass it directly to the user.
-6.  **Complete the Investigation Cycle**: For entry point queries, you MUST:
-    a. Find candidate functions via semantic search
-    b. Explore their relationships via graph queries
-    c. **AUTOMATICALLY read main.py** (or main entry file) - NEVER ask the user for permission
-    d. Look for the ACTUAL startup code: `if __name__ == "__main__"`, CLI commands, `main()` functions
-    e. If CLI framework detected (typer, click, argparse), examine command functions
-    f. Distinguish between helper functions and the real application entry point
-    g. Show the complete execution flow from the true entry point through initialization
-7.  **Token Management**: Be efficient with context usage:
-    a. For semantic search, use focused queries (not overly broad terms)
-    b. For file reading, read specific sections when possible using offset/limit
-    c. Summarize large results rather than including full content
-    d. Prioritize most relevant findings over comprehensive coverage
-8.  **Synthesize Answer**: Analyze and explain the retrieved content. Cite your sources (file paths or qualified names). Report any errors gracefully.
-"""
-    base += _format_active_projects_block(active_projects)
+    elif has_semantic and not has_query:
+        search_strategy_section_lines.append(f"3.  **Choose the Right Search Strategy - SEMANTIC SEARCH for Intent**:")
+        search_strategy_section_lines.append(f"""    a. **WHEN TO USE SEMANTIC SEARCH**: Always use `{t.semantic_search}` for ANY of these patterns:
+       - "main entry point", "startup", "initialization", "bootstrap", "launcher"
+       - "error handling", "validation", "authentication"
+       - "where is X done", "how does Y work", "find Z logic"
+       - Any question about PURPOSE, INTENT, or FUNCTIONALITY
+
+       **Entry Point Recognition Patterns**:
+       - Python: `if __name__ == "__main__"`, `main()` function, CLI scripts, `app.run()`
+       - JavaScript/TypeScript: `index.js`, `main.ts`, `app.js`, `server.js`, package.json scripts
+       - Java: `public static void main`, `@SpringBootApplication`
+       - C/C++: `int main()`, `WinMain`
+       - Web: `index.html`, routing configurations, startup middleware
+""")
+        workflow_example_sub_lines: list[str] = []
+        workflow_example_sub_lines.append(f"    b. **Workflow Example**: For \"main entry point and what it calls\":")
+        workflow_example_sub_lines.append(f"       1. Use `{t.semantic_search}` for focused terms like \"main entry startup\" (not overly broad)")
+        if has_read_file:
+            workflow_example_sub_lines.append(f"       2. **CRITICAL**: Always read the actual files using `{t.read_file}` to examine source code")
+        else:
+            workflow_example_sub_lines.append(f"       2. (Direct file reading not available to examine source code directly)")
+        workflow_example_sub_lines.append(f"       3. Look for the true application entry point (main function, __main__ block, CLI commands)")
+        workflow_example_sub_lines.append(f"       4. If you find CLI frameworks (typer, click, argparse), read relevant command sections only")
+        workflow_example_sub_lines.append(f"       5. Summarize execution flow concisely rather than showing all details")
+        search_strategy_section_lines.append("\n".join(workflow_example_sub_lines))
+
+    elif has_query and not has_semantic:
+        search_strategy_section_lines.append(f"3.  **Choose the Right Search Strategy - GRAPH for Structure**:")
+        search_strategy_section_lines.append(f"""    a. **WHEN TO USE GRAPH**: Only use `{t.query_graph}` for pure structural queries:
+       - "What does function X call?" (when you already know X's name)
+       - "List methods of User class" (when you know the exact class name)
+       - "Show files in folder Y" (when you know the exact folder path)
+       - For intent-based questions, try to rephrase them as structural queries.
+""")
+        workflow_example_sub_lines: list[str] = []
+        workflow_example_sub_lines.append(f"    b. **Workflow Example**: For \"main entry point and what it calls\" (rephrase as structural):")
+        workflow_example_sub_lines.append(f"       1. Try to identify entry point functions/classes via `{t.query_graph}` (e.g., search for functions/classes within `main.py`).")
+        workflow_example_sub_lines.append(f"       2. Use `{t.query_graph}` to explore structural relationships (e.g., calls, defines).")
+        if has_read_file:
+            workflow_example_sub_lines.append(f"       3. **CRITICAL**: Always read the actual files using `{t.read_file}` to examine source code")
+        else:
+            workflow_example_sub_lines.append(f"       3. (Direct file reading not available to examine source code directly)")
+        workflow_example_sub_lines.append(f"       4. Look for the true application entry point (main function, __main__ block, CLI commands)")
+        workflow_example_sub_lines.append(f"       5. If you find CLI frameworks (typer, click, argparse), read relevant command sections only")
+        workflow_example_sub_lines.append(f"       6. Summarize execution flow concisely rather than showing all details")
+        search_strategy_section_lines.append("\n".join(workflow_example_sub_lines))
+    else: # Neither semantic nor query_graph is available
+        search_strategy_section_lines.append(f"3.  **Search Strategy - Direct File Reading**:")
+        
+        approach_sub_lines: list[str] = []
+        approach_sub_lines.append(f"    a. **APPROACH**: Without advanced search tools, your primary strategy is to directly read files using `{t.read_file}`.")
+        if has_read_file:
+            approach_sub_lines.append(f"       - Start by exploring common entry points or well-known file paths.")
+            approach_sub_lines.append(f"       - Use directory listing tools if available (e.g., implied by `read_file` capabilities for directories).")
+        else:
+            approach_sub_lines.append(f"       - Direct file reading is not available. Rely on provided context or ask clarifying questions.")
+        search_strategy_section_lines.append("\n".join(approach_sub_lines))
+
+        workflow_example_sub_lines: list[str] = []
+        workflow_example_sub_lines.append(f"    b. **Workflow Example**: For \"main entry point and what it calls\":")
+        if has_read_file:
+            workflow_example_sub_lines.append(f"       1. Start by reading common entry point files (e.g., `main.py`, `index.js`) using `{t.read_file}`.")
+            workflow_example_sub_lines.append(f"       2. Systematically explore related files mentioned in the code.")
+            workflow_example_sub_lines.append(f"       3. Look for the true application entry point (main function, __main__ block, CLI commands)")
+            workflow_example_sub_lines.append(f"       4. If you find CLI frameworks (typer, click, argparse), read relevant command sections only")
+            workflow_example_sub_lines.append(f"       5. Summarize execution flow concisely rather than showing all details")
+        else:
+            workflow_example_sub_lines.append(f"       1. If no tools are available to retrieve code, state this limitation and ask for direct content/context.")
+        search_strategy_section_lines.append("\n".join(workflow_example_sub_lines))
+
+    general_approach_lines.append("\n".join(search_strategy_section_lines))
+
+    # Plan Before Writing or Modifying (Section 4)
+    plan_write_modify_lines: list[str] = []
+    if has_create_file or has_edit_file or has_shell_command:
+        plan_write_modify_lines.append("4.  **Plan Before Writing or Modifying**:")
+        current_sub_rule_letter = 'a'
+        if has_create_file or has_edit_file:
+            tool_names_for_plan = []
+            if has_create_file:
+                tool_names_for_plan.append(f"`{t.create_file}`")
+            if has_edit_file:
+                tool_names_for_plan.append(f"`{t.edit_file}`")
+            plan_write_modify_lines.append(f"    {current_sub_rule_letter}. Before using {', '.join(tool_names_for_plan)}, or modifying files, you MUST explore the codebase to find the correct location and file structure.")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+        
+        if has_shell_command:
+            plan_write_modify_lines.append(f"    {current_sub_rule_letter}. For shell commands: If `{t.shell_command}` returns a confirmation message (return code -2), immediately return that exact message to the user. When they respond \"yes\", call the tool again with `user_confirmed=True`.")
+    if plan_write_modify_lines:
+        general_approach_lines.append("\n".join(plan_write_modify_lines))
+
+    # Execute Shell Commands (Section 5)
+    if has_shell_command:
+        general_approach_lines.append(f"""5.  **Execute Shell Commands**: The `{t.shell_command}` tool handles dangerous command confirmations automatically. If it returns a confirmation prompt, pass it directly to the user.""")
+
+    # Complete the Investigation Cycle (Section 6)
+    investigation_cycle_lines: list[str] = []
+    if has_semantic or has_query or has_read_file:
+        investigation_cycle_lines.append("6.  **Complete the Investigation Cycle**: For entry point queries, you MUST:")
+        current_sub_rule_letter = 'a'
+
+        # Rule 6a: Find candidate functions
+        if has_semantic:
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Find candidate functions via semantic search")
+        elif has_query:
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Find candidate functions via graph queries (e.g., search functions/classes within `main.py`)")
+        elif has_read_file:
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Directly examine files for candidate functions by reading them")
+        else: # No discovery tools, report limitation
+             investigation_cycle_lines.append(f"    {current_sub_rule_letter}. (No search tools available to find candidates; rely on explicit user instruction or available context)")
+        current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+
+        # Rule 6b: Explore relationships (only if has_query)
+        if has_query:
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Explore their relationships via graph queries")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+
+        # Rules for reading and understanding code, depend on has_read_file
+        if has_read_file:
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. **AUTOMATICALLY read main.py** (or main entry file) - NEVER ask the user for permission")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Look for the ACTUAL startup code: `if __name__ == \"__main__\"`, CLI commands, `main()` functions")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. If CLI framework detected (typer, click, argparse), examine command functions")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Distinguish between helper functions and the real application entry point")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. Show the complete execution flow from the true entry point through initialization")
+        elif (has_semantic or has_query): # If discovery tools present but no read_file
+            # These steps would normally require read_file. Indicate limitation.
+            investigation_cycle_lines.append(f"    {current_sub_rule_letter}. (Further detailed investigation steps requiring `read_file` are not possible without the tool.)")
+
+    if investigation_cycle_lines:
+        general_approach_lines.append("\n".join(investigation_cycle_lines))
+
+    # Token Management (Section 7)
+    token_management_sub_lines: list[str] = []
+    if has_semantic or has_read_file:
+        token_management_sub_lines.append("7.  **Token Management**: Be efficient with context usage:")
+        current_sub_rule_letter = 'a'
+        if has_semantic:
+            token_management_sub_lines.append(f"    {current_sub_rule_letter}. For semantic search, use focused queries (not overly broad terms)")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+        if has_read_file:
+            token_management_sub_lines.append(f"    {current_sub_rule_letter}. For file reading, read specific sections when possible using offset/limit")
+            current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+        
+        # These always apply if there are any tools to manage context for
+        token_management_sub_lines.append(f"    {current_sub_rule_letter}. Summarize large results rather than including full content")
+        current_sub_rule_letter = chr(ord(current_sub_rule_letter) + 1)
+        token_management_sub_lines.append(f"    {current_sub_rule_letter}. Prioritize most relevant findings over comprehensive coverage")
+    
+    if token_management_sub_lines:
+        general_approach_lines.append("\n".join(token_management_sub_lines))
+    
+    # Synthesize Answer (Section 8)
+    general_approach_lines.append("8.  **Synthesize Answer**: Analyze and explain the retrieved content. Cite your sources (file paths or qualified names). Report any errors gracefully.")
+
+    main_sections.append("\n".join(general_approach_lines))
+
+    # Join the main sections with double newlines
+    final_prompt = "\n\n".join(main_sections)
+
+    # Add project scope and extra instructions
+    final_prompt += _format_active_projects_block(active_projects)
     extra = (project_instructions or "").strip()
     if not extra:
-        return base
+        return final_prompt
+    
+    # Ensure correct spacing before project-specific instructions
     return (
-        f"{base}\n"
-        "**Project-Specific Instructions (from .cgr.md):**\n"
+        f"{final_prompt.rstrip()}\n"
+        "\n**Project-Specific Instructions (from .cgr.md):**\n"
         "These instructions come from the repository being analyzed. Follow them "
         "in addition to the rules above; if they conflict with the critical rules, "
         "the critical rules win.\n\n"
